@@ -25,7 +25,7 @@ class BulkColumnEditorApp(tk.Tk):
         self.col_combo = ttk.Combobox(
             frame_top,
             textvariable=self.target_col,
-            values=self.columns,
+            values=self.columns[1:],
             width=14,
             state="readonly",
         )
@@ -112,7 +112,7 @@ class BulkColumnEditorApp(tk.Tk):
         self._commit_editor()
         col_id = self.tree.identify_column(event.x)
         index = int(col_id.replace("#", "")) - 1
-        if 0 <= index < len(self.columns):
+        if 0 < index < len(self.columns):
             self.target_col.set(self.columns[index])
 
     def _on_cell_double_click(self, event):
@@ -139,7 +139,8 @@ class BulkColumnEditorApp(tk.Tk):
         current_values = list(self.tree.item(row_id, "values"))
         current_value = current_values[col_index]
 
-        editor = ttk.Entry(self.tree)
+        editor_values = self._build_cell_editor_values(col_index)
+        editor = ttk.Combobox(self.tree, values=editor_values, state="normal")
         editor.insert(0, current_value)
         editor.select_range(0, tk.END)
         editor.focus_set()
@@ -152,6 +153,28 @@ class BulkColumnEditorApp(tk.Tk):
         editor.bind("<Return>", self._commit_editor)
         editor.bind("<Escape>", lambda _e: self._destroy_editor())
         editor.bind("<FocusOut>", self._commit_editor)
+        editor.bind("<<ComboboxSelected>>", self._commit_editor)
+
+    def _build_cell_editor_values(self, col_index):
+        values = []
+        seen = set()
+
+        # Always offer a fixed option to quickly mark a cell as disabled.
+        for candidate in ("disable",):
+            values.append(candidate)
+            seen.add(candidate)
+
+        for item in self.tree.get_children(""):
+            row_values = self.tree.item(item, "values")
+            if col_index >= len(row_values):
+                continue
+            candidate = row_values[col_index]
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            values.append(candidate)
+
+        return values
 
     def _commit_editor(self, _event=None):
         if not self._editor:
