@@ -9,6 +9,7 @@ class BulkColumnEditorApp(tk.Tk):
         self.geometry("860x480")
 
         self.columns = ("ID", "Name", "Department", "Status", "Note")
+        self.bulk_fixed_values = ("disable",)
         self._editor = None
         self._editor_item = None
         self._editor_col_index = None
@@ -30,6 +31,7 @@ class BulkColumnEditorApp(tk.Tk):
             state="readonly",
         )
         self.col_combo.grid(row=0, column=1, padx=(0, 16), pady=4)
+        self.col_combo.bind("<<ComboboxSelected>>", self._on_target_col_changed)
 
         ttk.Label(frame_top, text="Mode").grid(row=0, column=2, padx=(0, 8), pady=4)
         self.mode = tk.StringVar(value="set")
@@ -44,8 +46,8 @@ class BulkColumnEditorApp(tk.Tk):
         self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_changed)
 
         ttk.Label(frame_top, text="Value").grid(row=0, column=4, padx=(0, 8), pady=4)
-        self.value_entry = ttk.Entry(frame_top, width=20)
-        self.value_entry.grid(row=0, column=5, padx=(0, 16), pady=4)
+        self.value_combo = ttk.Combobox(frame_top, width=20, state="normal")
+        self.value_combo.grid(row=0, column=5, padx=(0, 16), pady=4)
 
         ttk.Label(frame_top, text="Replace from").grid(row=1, column=4, padx=(0, 8), pady=4)
         self.before_entry = ttk.Entry(frame_top, width=20)
@@ -84,6 +86,7 @@ class BulkColumnEditorApp(tk.Tk):
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self._on_mode_changed()
+        self._refresh_bulk_value_candidates()
 
     def _load_sample_data(self):
         sample_rows = [
@@ -103,6 +106,9 @@ class BulkColumnEditorApp(tk.Tk):
         else:
             self.before_entry.delete(0, tk.END)
             self.before_entry.state(["disabled"])
+
+    def _on_target_col_changed(self, _event=None):
+        self._refresh_bulk_value_candidates()
 
     def _on_tree_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
@@ -176,6 +182,33 @@ class BulkColumnEditorApp(tk.Tk):
 
         return values
 
+    def _refresh_bulk_value_candidates(self):
+        col = self.target_col.get()
+        col_index = self.columns.index(col)
+        candidates = self._build_column_candidates(col_index)
+        self.value_combo.configure(values=candidates)
+
+    def _build_column_candidates(self, col_index):
+        values = []
+        seen = set()
+
+        for candidate in self.bulk_fixed_values:
+            if candidate not in seen:
+                seen.add(candidate)
+                values.append(candidate)
+
+        for item in self.tree.get_children(""):
+            row_values = self.tree.item(item, "values")
+            if col_index >= len(row_values):
+                continue
+            candidate = row_values[col_index]
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            values.append(candidate)
+
+        return values
+
     def _commit_editor(self, _event=None):
         if not self._editor:
             return
@@ -186,6 +219,7 @@ class BulkColumnEditorApp(tk.Tk):
         values = list(self.tree.item(row_id, "values"))
         values[col_index] = new_value
         self.tree.item(row_id, values=values)
+        self._refresh_bulk_value_candidates()
 
         self._destroy_editor()
 
@@ -201,7 +235,7 @@ class BulkColumnEditorApp(tk.Tk):
 
         col = self.target_col.get()
         mode = self.mode.get()
-        value = self.value_entry.get()
+        value = self.value_combo.get()
         before = self.before_entry.get()
         col_index = self.columns.index(col)
 
@@ -222,6 +256,7 @@ class BulkColumnEditorApp(tk.Tk):
                 self.tree.item(item, values=current_values)
                 updated_count += 1
 
+        self._refresh_bulk_value_candidates()
         messagebox.showinfo("Done", f"Updated: {updated_count} row(s)")
 
     @staticmethod
