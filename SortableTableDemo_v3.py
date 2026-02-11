@@ -73,6 +73,7 @@ class SortableTableDemo(ttk.Frame):
         # ボタンオーバーレイ
         self._action_button = None
         self._action_target = None       # item_id
+        self._next_row_id = 1            # deleted rows do not reuse IDs
 
         self._build_ui()
         self._insert_demo_rows()
@@ -147,6 +148,7 @@ class SortableTableDemo(ttk.Frame):
         ]
         for r in rows:
             self.tree.insert("", "end", values=self._normalize_row(r))
+        self._next_row_id = max((r[0] for r in rows), default=0) + 1
 
     def _normalize_row(self, row_tuple):
         row = list(row_tuple)
@@ -165,7 +167,9 @@ class SortableTableDemo(ttk.Frame):
 
     # ---------------- Data ops ----------------
     def add_row(self):
-        next_id = len(self.tree.get_children()) + 1
+        # Keep IDs unique/monotonic even when rows are deleted.
+        next_id = max(self._next_row_id, self._max_existing_id() + 1)
+        self._next_row_id = next_id + 1
         today = datetime.now().strftime("%Y-%m-%d")
         row = (
             next_id, f"Task {next_id}",
@@ -175,6 +179,17 @@ class SortableTableDemo(ttk.Frame):
             0, 0.0, 0, today, "Run", ""
         )
         self.tree.insert("", "end", values=self._normalize_row(row))
+
+    def _max_existing_id(self) -> int:
+        id_index = self.columns.index("id")
+        max_id = 0
+        for item_id in self.tree.get_children(""):
+            vals = self.tree.item(item_id, "values")
+            try:
+                max_id = max(max_id, int(vals[id_index]))
+            except Exception:
+                continue
+        return max_id
 
     def delete_selected(self):
         self._commit_edit(force=True)
