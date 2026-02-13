@@ -1,11 +1,14 @@
-import tkinter as tk
+﻿import tkinter as tk
 from tkinter import ttk
+import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 CHECK_ON = "[x]"
 CHECK_OFF = "[ ]"
+FILTER_ALL = ""
+FILTER_SPACER_IID = "__filter_spacer__"
 
 
 @dataclass
@@ -33,6 +36,10 @@ class TableDemoConfig:
     row_height: int = 28
     tree_font: Tuple[str, int] = ("Segoe UI", 10)
     heading_font: Tuple[str, int, str] = ("Segoe UI", 10, "bold")
+    heading_background: str = "#d3d3d3"
+    heading_foreground: str = "#1f2937"
+    filter_row_background: str = "#fff9cc"
+    filter_row_foreground: str = "#111827"
     action_button_padding: Tuple[int, int] = (4, 1)
     action_button_inset: int = 2
     action_button_min_width: int = 24
@@ -194,9 +201,17 @@ class SortableTableDemo(ttk.Frame):
         self._action_button = None
         self._action_target = None
         self._next_row_id = 1
+        self._filter_values: Dict[str, str] = {}
+        self._filter_candidates: Dict[str, List[str]] = {}
+        self._data_item_ids: List[str] = []
+        for col in self.columns:
+            if col != self.action_col:
+                self._filter_values[col] = FILTER_ALL
 
         self._build_ui()
         self._insert_demo_rows()
+        self._rebuild_filter_values()
+        self._apply_filters()
         self._bind_events()
 
     def _bind_events(self) -> None:
@@ -242,6 +257,13 @@ class SortableTableDemo(ttk.Frame):
         style.configure(
             f"{self.table_config.tree_style_name}.Heading",
             font=self.table_config.heading_font,
+            background=self.table_config.heading_background,
+            foreground=self.table_config.heading_foreground,
+        )
+        style.map(
+            f"{self.table_config.tree_style_name}.Heading",
+            background=[("active", self.table_config.heading_background)],
+            foreground=[("active", self.table_config.heading_foreground)],
         )
         style.configure(
             self.table_config.action_button_style_name,
@@ -250,6 +272,11 @@ class SortableTableDemo(ttk.Frame):
 
         self.tree = ttk.Treeview(mid, columns=self.columns, show="headings", selectmode="extended")
         self.tree.configure(style=self.table_config.tree_style_name)
+        self.tree.tag_configure(
+            "filter_row",
+            background=self.table_config.filter_row_background,
+            foreground=self.table_config.filter_row_foreground,
+        )
 
         for col in self.table_config.columns:
             self.tree.heading(col.key, text=col.heading, command=lambda c=col.key: self.sort_by_column(c))
@@ -266,6 +293,7 @@ class SortableTableDemo(ttk.Frame):
         xscroll.grid(row=1, column=0, sticky="ew")
         mid.grid_rowconfigure(0, weight=1)
         mid.grid_columnconfigure(0, weight=1)
+        self._insert_filter_spacer_row()
 
         self.error_bar = ttk.Label(self, text="", anchor="w")
         self.error_bar.pack(fill="x", padx=self.table_config.error_bar_padx, pady=(0, self.table_config.error_bar_pady_bottom))
@@ -273,7 +301,8 @@ class SortableTableDemo(ttk.Frame):
     def _insert_demo_rows(self) -> None:
         """設定の初期データ行をテーブルへ挿入する。"""
         for row in self.table_config.demo_rows:
-            self.tree.insert("", "end", values=self._normalize_row_dict(row))
+            item_id = self.tree.insert("", "end", values=self._normalize_row_dict(row))
+            self._data_item_ids.append(item_id)
         self._next_row_id = max((int(r.get("id", 0)) for r in self.table_config.demo_rows), default=0) + 1
 
     def _normalize_row_dict(self, row: Dict[str, object]) -> Tuple[object, ...]:
@@ -309,7 +338,10 @@ class SortableTableDemo(ttk.Frame):
             else:
                 row[key] = value
 
-        self.tree.insert("", "end", values=self._normalize_row_dict(row))
+        item_id = self.tree.insert("", "end", values=self._normalize_row_dict(row))
+        self._data_item_ids.append(item_id)
+        self._rebuild_filter_values()
+        self._apply_filters()
 
     def _max_existing_id(self) -> int:
         """現在の行データから最大IDを取得する。"""
@@ -318,7 +350,7 @@ class SortableTableDemo(ttk.Frame):
             return 0
 
         max_id = 0
-        for item_id in self.tree.get_children(""):
+        for item_id in self._iter_data_item_ids():
             vals = self.tree.item(item_id, "values")
             try:
                 max_id = max(max_id, int(vals[idx]))
@@ -330,12 +362,18 @@ class SortableTableDemo(ttk.Frame):
         """選択中の行を削除する。"""
         self._commit_edit(force=True)
         for item_id in self.tree.selection():
+            if item_id == FILTER_SPACER_IID:
+                continue
             self.tree.delete(item_id)
+            if item_id in self._data_item_ids:
+                self._data_item_ids.remove(item_id)
+        self._rebuild_filter_values()
+        self._apply_filters()
 
     def get_data(self) -> List[Dict[str, object]]:
         """テーブル値を list[dict] で返す（数値/真偽値は可能な範囲で変換）。"""
         out = []
-        for item_id in self.tree.get_children(""):
+        for item_id in self._iter_data_item_ids():
             vals = list(self.tree.item(item_id, "values"))
             row = {col: vals[i] for i, col in enumerate(self.columns)}
             if "active" in row:
@@ -426,7 +464,7 @@ class SortableTableDemo(ttk.Frame):
     def validate_all_rows(self) -> bool:
         """全行を検証し、最初のエラーを表示して結果を返す。"""
         self._commit_edit(force=True)
-        for item_id in self.tree.get_children(""):
+        for item_id in self._iter_data_item_ids():
             vals = list(self.tree.item(item_id, "values"))
             for i, col in enumerate(self.columns):
                 ok, msg = self.validate_cell(col, str(vals[i]))
@@ -450,7 +488,7 @@ class SortableTableDemo(ttk.Frame):
         sort_type = self.sort_types.get(col, "text")
         col_index = self.columns.index(col)
 
-        items = list(self.tree.get_children(""))
+        items = self._iter_data_item_ids()
 
         def key_func(item_id: str):
             vals = self.tree.item(item_id, "values")
@@ -469,8 +507,8 @@ class SortableTableDemo(ttk.Frame):
                 return (1, str(v))
 
         items.sort(key=key_func, reverse=not asc)
-        for i, item_id in enumerate(items):
-            self.tree.move(item_id, "", i)
+        self._data_item_ids = items
+        self._apply_filters()
 
         for c in self.columns:
             self.tree.heading(c, text=self.headings[c], command=lambda cc=c: self.sort_by_column(cc))
@@ -492,6 +530,13 @@ class SortableTableDemo(ttk.Frame):
             self._handle_editor_transition_on_cell_change(None, None)
             self._hide_overlays()
             return
+        if item_id == FILTER_SPACER_IID:
+            self._hide_overlays()
+            col_index = int(col_id.replace("#", "")) - 1
+            col_name = self.columns[col_index]
+            if col_name != self.action_col:
+                self._begin_filter_combobox_edit(col_name)
+            return "break"
 
         col_index = int(col_id.replace("#", "")) - 1
         col_name = self.columns[col_index]
@@ -520,6 +565,12 @@ class SortableTableDemo(ttk.Frame):
         col_id = self.tree.identify_column(event.x)
         if not item_id or not col_id:
             return
+        if item_id == FILTER_SPACER_IID:
+            col_index = int(col_id.replace("#", "")) - 1
+            col_name = self.columns[col_index]
+            if col_name != self.action_col:
+                self._begin_filter_combobox_edit(col_name)
+            return "break"
 
         col_index = int(col_id.replace("#", "")) - 1
         col_name = self.columns[col_index]
@@ -553,6 +604,9 @@ class SortableTableDemo(ttk.Frame):
             # Stale editor reference must never block future edits.
             self._destroy_editor()
             return True
+        if editing_item_id == FILTER_SPACER_IID:
+            self._commit_edit(force=True)
+            return self._editor is None
         ok, _ = self.validate_cell(editing_col_name, current_value)
         if ok:
             self._commit_edit(force=False)
@@ -567,6 +621,8 @@ class SortableTableDemo(ttk.Frame):
         vals = list(self.tree.item(item_id, "values"))
         vals[idx] = CHECK_OFF if vals[idx] == CHECK_ON else CHECK_ON
         self.tree.item(item_id, values=vals)
+        self._rebuild_filter_values()
+        self._apply_filters()
 
     def _show_action_button(self, item_id: str) -> None:
         """Actionセル上に実ボタンを重ねて表示する。"""
@@ -611,6 +667,43 @@ class SortableTableDemo(ttk.Frame):
             self._action_button.destroy()
             self._action_button = None
             self._action_target = None
+
+    def _begin_filter_combobox_edit(self, col_name: str) -> None:
+        """フィルター行セルに対するCombobox編集を開始する。"""
+        self._commit_edit(force=True)
+
+        item_id = FILTER_SPACER_IID
+        col_index = self.columns.index(col_name)
+        bbox = self.tree.bbox(item_id, column=f"#{col_index + 1}")
+        if not bbox:
+            return
+        x, y, w, h = bbox
+
+        current = self._filter_values.get(col_name, FILTER_ALL)
+        values = list(self._filter_candidates.get(col_name, [FILTER_ALL]))
+        if not values:
+            values = [FILTER_ALL]
+        if current not in values:
+            values.insert(0, current)
+
+        cb = ttk.Combobox(self.tree, values=values, state="normal")
+        cb.set(current)
+        cb.place(x=x, y=y, width=w, height=h)
+
+        self._editor = cb
+        self._editing = (item_id, col_name)
+        self._editing_original = current
+        self._editing_bbox = bbox
+        self._invalid = False
+        self._clear_error()
+
+        cb.bind("<<ComboboxSelected>>", lambda e: self._on_filter_input_change(col_name, cb))
+        cb.bind("<KeyRelease>", lambda e: self._on_filter_input_change(col_name, cb))
+        cb.bind("<Return>", lambda e: self._commit_edit(force=False))
+        cb.bind("<Escape>", lambda e: self._cancel_edit())
+        cb.bind("<FocusOut>", lambda e: self._on_combobox_focus_out(cb))
+
+        cb.focus_set()
 
     def _begin_combobox_edit(self, item_id: str, col_name: str) -> None:
         """列挙値列に対するCombobox編集を開始する。"""
@@ -744,6 +837,19 @@ class SortableTableDemo(ttk.Frame):
             # Editor widget was already destroyed by focus/event race.
             self._destroy_editor()
             return
+
+        if item_id == FILTER_SPACER_IID:
+            ok, msg = self._commit_filter_edit(col_name, new_value)
+            if not ok and not force:
+                self._apply_validation_ui(False, msg)
+                return
+            self._destroy_editor()
+            if ok:
+                self._clear_error()
+            else:
+                self._set_error(msg)
+            return
+
         if col_name in self.custom_dropdown_cols and new_value and new_value not in self.dropdown_values[col_name]:
             self.dropdown_values[col_name].append(new_value)
 
@@ -755,6 +861,8 @@ class SortableTableDemo(ttk.Frame):
         vals = list(self.tree.item(item_id, "values"))
         vals[col_index] = new_value
         self.tree.item(item_id, values=vals)
+        self._rebuild_filter_values()
+        self._apply_filters()
 
         self._destroy_editor()
 
@@ -774,6 +882,11 @@ class SortableTableDemo(ttk.Frame):
         """編集開始時に保持した元の値をセルへ復元する。"""
         if self._editing is not None and self._editing_original is not None:
             item_id, col_name = self._editing
+            if item_id == FILTER_SPACER_IID:
+                self._filter_values[col_name] = self._editing_original
+                self._refresh_filter_row_values()
+                self._destroy_editor()
+                return
             col_index = self.columns.index(col_name)
             vals = list(self.tree.item(item_id, "values"))
             vals[col_index] = self._editing_original
@@ -794,6 +907,370 @@ class SortableTableDemo(ttk.Frame):
         self._editing_bbox = None
         self._invalid = False
 
+    def _iter_data_item_ids(self) -> List[str]:
+        """Return existing data row IDs excluding the filter spacer row."""
+        return [
+            item_id
+            for item_id in self._data_item_ids
+            if item_id != FILTER_SPACER_IID and self.tree.exists(item_id)
+        ]
+
+    def _insert_filter_spacer_row(self) -> None:
+        """Insert a first-row filter row."""
+        if self.tree.exists(FILTER_SPACER_IID):
+            return
+        self.tree.insert(
+            "",
+            0,
+            iid=FILTER_SPACER_IID,
+            values=self._build_filter_row_values(),
+            tags=("filter_row",),
+        )
+
+    def _move_filter_spacer_to_top(self) -> None:
+        """Keep the filter row pinned to the top."""
+        if self.tree.exists(FILTER_SPACER_IID):
+            self.tree.move(FILTER_SPACER_IID, "", 0)
+
+    def _build_filter_row_values(self) -> Tuple[object, ...]:
+        """Build the visible values for the filter row."""
+        values = []
+        for col in self.columns:
+            if col == self.action_col:
+                values.append("")
+            else:
+                values.append(self._filter_values.get(col, FILTER_ALL))
+        return tuple(values)
+
+    def _refresh_filter_row_values(self) -> None:
+        """Redraw current filter values on the filter row."""
+        if not self.tree.exists(FILTER_SPACER_IID):
+            return
+        self.tree.item(FILTER_SPACER_IID, values=self._build_filter_row_values())
+
+    def _rebuild_filter_values(self) -> None:
+        """Refresh filter candidates from current data rows."""
+        for col in self.columns:
+            if col == self.action_col:
+                continue
+            col_index = self.columns.index(col)
+            values = []
+            for item_id in self._iter_data_item_ids():
+                row_values = self.tree.item(item_id, "values")
+                if col_index < len(row_values):
+                    values.append(str(row_values[col_index]))
+            uniq = sorted(set(values))
+            candidates = [FILTER_ALL] + uniq
+            self._filter_candidates[col] = candidates
+            current = self._filter_values.get(col, FILTER_ALL)
+            if current != FILTER_ALL:
+                if self._is_numeric_filter_column(col):
+                    if not self._is_valid_numeric_filter(col, current):
+                        self._filter_values[col] = FILTER_ALL
+                elif not self._is_valid_regex(self._to_effective_regex(current)):
+                    self._filter_values[col] = FILTER_ALL
+        self._refresh_filter_row_values()
+
+    def _row_matches_filters(self, item_id: str) -> bool:
+        """Check whether a row satisfies all active filter selections."""
+        row_values = self.tree.item(item_id, "values")
+        for col, selected in self._filter_values.items():
+            if col == self.action_col:
+                continue
+            col_index = self.columns.index(col)
+            value = str(row_values[col_index]) if col_index < len(row_values) else ""
+            if not self._match_filter_value(col, value, selected):
+                return False
+        return True
+
+    def _apply_filters(self) -> None:
+        """Apply filter row selections by detaching non-matching rows."""
+        data_item_ids = self._iter_data_item_ids()
+        for item_id in data_item_ids:
+            self.tree.detach(item_id)
+        for item_id in data_item_ids:
+            if self._row_matches_filters(item_id):
+                self.tree.reattach(item_id, "", "end")
+        self._refresh_filter_row_values()
+        self._move_filter_spacer_to_top()
+
+    def _on_filter_input_change(self, col_name: str, cb: ttk.Combobox) -> None:
+        """Apply filter immediately while typing in filter combobox."""
+        if self._editor is not cb or self._editing != (FILTER_SPACER_IID, col_name):
+            return
+        ok, msg = self._commit_filter_edit(col_name, cb.get())
+        if ok:
+            self._invalid = False
+            self._clear_error()
+        else:
+            self._invalid = True
+            self._set_error(msg)
+
+    def _commit_filter_edit(self, col_name: str, new_value: str) -> Tuple[bool, str]:
+        """Commit one filter cell change and re-apply row filtering."""
+        if col_name == self.action_col:
+            return True, ""
+
+        normalized = new_value.strip()
+        if not normalized:
+            normalized = FILTER_ALL
+        if normalized != FILTER_ALL:
+            if self._is_numeric_filter_column(col_name):
+                if not self._is_valid_numeric_filter(col_name, normalized):
+                    return False, f"Invalid numeric filter for {col_name}"
+            else:
+                effective_pattern = self._to_effective_regex(normalized)
+                if not self._is_valid_regex(effective_pattern):
+                    return False, f"Invalid regex for {col_name}"
+
+        self._filter_values[col_name] = normalized
+
+        self._apply_filters()
+        return True, ""
+
+    def _is_valid_regex(self, pattern: str) -> bool:
+        """Return True if the pattern can be compiled as regex."""
+        try:
+            re.compile(pattern)
+            return True
+        except re.error:
+            return False
+
+    def _to_effective_regex(self, selected: str) -> str:
+        """
+        Convert wildcard shorthand to effective regex.
+
+        Special cases:
+        - "text*" -> "^text.*"
+        - "*text" -> "text$"
+        - "*text*" -> "text" (contains)
+        - "a*b" -> "a.*b" (order match)
+        """
+        s = selected.strip()
+        if s == FILTER_ALL:
+            return s
+
+        if not self._contains_regex_meta_except_star(s):
+            # Keep explicit edge wildcard semantics.
+            if s.startswith("*") and s.endswith("*") and len(s) >= 2:
+                inner = s[1:-1].strip()
+                return re.escape(inner) if inner else ".*"
+            if s.endswith("*") and not s.startswith("*"):
+                prefix = s[:-1].strip()
+                return f"^{re.escape(prefix)}.*"
+            if s.startswith("*") and not s.endswith("*"):
+                suffix = s[1:].strip()
+                return f"{re.escape(suffix)}$"
+            # Internal wildcard(s): match tokens in order.
+            if "*" in s:
+                parts = [re.escape(part.strip()) for part in s.split("*") if part.strip()]
+                if not parts:
+                    return ".*"
+                return ".*".join(parts)
+        return s
+
+    @staticmethod
+    def _contains_regex_meta_except_star(text: str) -> bool:
+        """Return True if text includes regex metacharacters except '*'."""
+        return any(ch in ".^$+?{}[]|()\\" for ch in text)
+
+    def _is_numeric_filter_column(self, col_name: str) -> bool:
+        """Return True for numeric filter columns."""
+        return self.sort_types.get(col_name) in ("int", "float")
+
+    def _is_valid_numeric_filter(self, col_name: str, selected: str) -> bool:
+        """Return True if selected text can be parsed for the numeric column type."""
+        try:
+            if self.sort_types.get(col_name) == "int":
+                int(selected)
+            elif self.sort_types.get(col_name) == "float":
+                float(selected)
+            else:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _match_filter_value(self, col_name: str, value: str, selected: str) -> bool:
+        """Match one cell value against filter text."""
+        if selected == FILTER_ALL:
+            return True
+        if self._is_numeric_filter_column(col_name):
+            try:
+                if self.sort_types.get(col_name) == "int":
+                    return int(value) == int(selected)
+                return float(value) == float(selected)
+            except Exception:
+                return False
+        try:
+            return re.search(self._to_effective_regex(selected), value) is not None
+        except re.error:
+            return False
+
+
+# ============================================================
+# Test Section (future split target)
+# File name (future): test_sortable_table_regex_filter.py
+# ============================================================
+def test_regex_filter_mece() -> bool:
+    """
+    MECE coverage for regex filter behavior.
+
+    Scope:
+    - Valid regex: all rows match
+    - Valid regex: subset rows match
+    - Valid regex: no rows match
+    - Invalid regex: rejected
+
+    Returns:
+    - True: all tests passed
+    - False: any test failed
+    """
+    root = tk.Tk()
+    root.withdraw()
+    table = SortableTableDemo(root)
+
+    category_col = "category"
+    category_index = table.columns.index(category_col)
+    id_col = "id"
+    id_index = table.columns.index(id_col)
+
+    def visible_categories() -> List[str]:
+        visible_item_ids = [iid for iid in table.tree.get_children("") if iid != FILTER_SPACER_IID]
+        return [str(table.tree.item(iid, "values")[category_index]) for iid in visible_item_ids]
+
+    def visible_ids() -> List[int]:
+        visible_item_ids = [iid for iid in table.tree.get_children("") if iid != FILTER_SPACER_IID]
+        return [int(table.tree.item(iid, "values")[id_index]) for iid in visible_item_ids]
+
+    all_categories = sorted({str(row[category_col]) for row in table.table_config.demo_rows})
+    cases = [
+        {
+            "name": "all_rows_empty_pattern",
+            "pattern": "",
+            "expect_ok": True,
+            "expected": all_categories,
+        },
+        {
+            "name": "subset_prefix_anchor",
+            "pattern": "^D.*",
+            "expect_ok": True,
+            "expected": sorted(["Daily", "Drink"]),
+        },
+        {
+            "name": "subset_wildcard_prefix",
+            "pattern": "D*",
+            "expect_ok": True,
+            "expected": sorted(["Daily", "Drink"]),
+        },
+        {
+            "name": "subset_wildcard_suffix",
+            "pattern": "*nk",
+            "expect_ok": True,
+            "expected": sorted(["Drink"]),
+        },
+        {
+            "name": "subset_wildcard_suffix_with_space",
+            "pattern": "* nk",
+            "expect_ok": True,
+            "expected": sorted(["Drink"]),
+        },
+        {
+            "name": "subset_wildcard_contains",
+            "pattern": "*nk*",
+            "expect_ok": True,
+            "expected": sorted(["Drink"]),
+        },
+        {
+            "name": "subset_wildcard_contains_with_space",
+            "pattern": "* nk *",
+            "expect_ok": True,
+            "expected": sorted(["Drink"]),
+        },
+        {
+            "name": "subset_wildcard_order_internal",
+            "pattern": "D*nk",
+            "expect_ok": True,
+            "expected": sorted(["Drink"]),
+        },
+        {
+            "name": "subset_alternation",
+            "pattern": "^(Food|Work)$",
+            "expect_ok": True,
+            "expected": sorted(["Food", "Work"]),
+        },
+        {
+            "name": "no_rows_pattern",
+            "pattern": "^Z",
+            "expect_ok": True,
+            "expected": [],
+        },
+        {
+            "name": "invalid_regex",
+            "pattern": "[",
+            "expect_ok": False,
+            "expected": None,
+        },
+    ]
+
+    failures: List[str] = []
+    try:
+        for case in cases:
+            ok, msg = table._commit_filter_edit(category_col, case["pattern"])
+            if ok != case["expect_ok"]:
+                failures.append(
+                    f"{case['name']}: ok={ok}, expected_ok={case['expect_ok']}, msg={msg}"
+                )
+                continue
+
+            if case["expect_ok"]:
+                got = sorted(set(visible_categories()))
+                expected = case["expected"]
+                if got != expected:
+                    failures.append(f"{case['name']}: got={got}, expected={expected}")
+
+        numeric_cases = [
+            {
+                "name": "numeric_exact_id",
+                "pattern": "2",
+                "expect_ok": True,
+                "expected_ids": [2],
+            },
+            {
+                "name": "numeric_invalid_regex_like",
+                "pattern": "^2$",
+                "expect_ok": False,
+                "expected_ids": None,
+            },
+        ]
+
+        table._commit_filter_edit(category_col, FILTER_ALL)
+        for case in numeric_cases:
+            ok, msg = table._commit_filter_edit(id_col, case["pattern"])
+            if ok != case["expect_ok"]:
+                failures.append(
+                    f"{case['name']}: ok={ok}, expected_ok={case['expect_ok']}, msg={msg}"
+                )
+                continue
+
+            if case["expect_ok"]:
+                got_ids = sorted(set(visible_ids()))
+                expected_ids = case["expected_ids"]
+                if got_ids != expected_ids:
+                    failures.append(f"{case['name']}: got={got_ids}, expected={expected_ids}")
+
+        if failures:
+            print("[test_regex_filter_mece] FAILED")
+            for failure in failures:
+                print(f" - {failure}")
+            return False
+
+        print("[test_regex_filter_mece] PASSED")
+        return True
+    finally:
+        table.destroy()
+        root.destroy()
+
 
 def create_sortable_table(parent: tk.Misc, config: Optional[TableDemoConfig] = None) -> SortableTableDemo:
     """他フォームへ埋め込むためのテーブル生成ヘルパー。"""
@@ -807,6 +1284,9 @@ def main() -> None:
     root.geometry("1250x520")
     ui = SortableTableDemo(root)
     ui.pack(fill="both", expand=True)
+
+    # test
+    test_regex_filter_mece()
 
     root.mainloop()
 
